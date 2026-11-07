@@ -36,6 +36,20 @@ jobs:
             echo "${v}=$(jq -r .digest "push-$v.json")" >> digests.env
           done
           cat digests.env
+      - name: Trusted roots and GitHub signing config
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh attestation trusted-root > roots.jsonl
+          jq -c 'select(any(.certificateAuthorities[]?; .uri|test("githubapp")))' roots.jsonl > github-trusted-root.json
+          jq -c '{cas:[.certificateAuthorities[]?|.uri], tsas:[.timestampAuthorities[]?|.uri]}' github-trusted-root.json
+          cosign signing-config create \
+            --fulcio="url=$GH_FULCIO,api-version=1,start-time=2024-01-01T00:00:00Z,operator=github.com" \
+            --oidc-provider="url=https://token.actions.githubusercontent.com,api-version=1,start-time=2024-01-01T00:00:00Z,operator=github.com" \
+            --tsa="url=$GH_TSA,api-version=1,start-time=2024-01-01T00:00:00Z,operator=github.com" \
+            --tsa-config="EXACT:1" --out github-signing-config.json
+          cat github-signing-config.json
       - name: A — public-good keyless, exact production flags
         run: |
           set -euo pipefail
@@ -47,19 +61,15 @@ jobs:
         run: |
           set -euo pipefail
           d=$(grep ^b- digests.env | cut -d= -f2)
-          cosign sign --yes --use-signing-config=false --new-bundle-format=true \
-            --registry-referrers-mode=legacy \
-            --fulcio-url "$GH_FULCIO" --timestamp-server-url "$GH_TSA" \
-            --tlog-upload=false --insecure-skip-verify "$PKG@$d"
+          cosign sign --yes --new-bundle-format=true --registry-referrers-mode=legacy \
+            --signing-config github-signing-config.json --trusted-root github-trusted-root.json "$PKG@$d"
       - name: C — GitHub instance, legacy format, TSA, no tlog
         continue-on-error: true
         run: |
           set -euo pipefail
           d=$(grep ^c- digests.env | cut -d= -f2)
-          cosign sign --yes --use-signing-config=false --new-bundle-format=false \
-            --registry-referrers-mode=legacy \
-            --fulcio-url "$GH_FULCIO" --timestamp-server-url "$GH_TSA" \
-            --tlog-upload=false --insecure-skip-verify "$PKG@$d"
+          cosign sign --yes --new-bundle-format=false --registry-referrers-mode=legacy \
+            --signing-config github-signing-config.json --trusted-root github-trusted-root.json "$PKG@$d"
       - name: D digest
         id: d
         run: echo "digest=$(grep ^d- digests.env | cut -d= -f2)" >> "$GITHUB_OUTPUT"
@@ -73,17 +83,10 @@ jobs:
           predicate: '{}'
           push-to-registry: true
           private-signing: true
-      - name: Trusted roots
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh attestation trusted-root > roots.jsonl
-          jq -c 'select(any(.certificateAuthorities[]?; .uri|test("githubapp")))' roots.jsonl > github-trusted-root.json
-          jq -c '{cas:[.certificateAuthorities[]?|.uri], tsas:[.timestampAuthorities[]?|.uri]}' github-trusted-root.json
       - uses: actions/upload-artifact@v4
         with:
           name: probe-oci
           path: |
             digests.env
             github-trusted-root.json
+            github-signing-config.json
