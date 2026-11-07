@@ -68,8 +68,9 @@ jobs:
         run: |
           set -euo pipefail
           d=$(grep ^c- digests.env | cut -d= -f2)
-          cosign sign --yes --new-bundle-format=false --registry-referrers-mode=legacy \
-            --signing-config github-signing-config.json --trusted-root github-trusted-root.json "$PKG@$d"
+          cosign sign --yes --new-bundle-format=false --use-signing-config=false --registry-referrers-mode=legacy \
+            --fulcio-url "$GH_FULCIO" --timestamp-server-url "$GH_TSA" --tlog-upload=false \
+            --trusted-root github-trusted-root.json "$PKG@$d"
       - name: D digest
         id: d
         run: echo "digest=$(grep ^d- digests.env | cut -d= -f2)" >> "$GITHUB_OUTPUT"
