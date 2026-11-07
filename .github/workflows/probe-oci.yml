@@ -1,0 +1,89 @@
+name: probe-oci
+on:
+  workflow_dispatch:
+permissions:
+  id-token: write
+  attestations: write
+  packages: write
+  contents: read
+env:
+  PKG: ghcr.io/aljazceru/sigstore-probe-pkg
+  GH_FULCIO: https://fulcio.githubapp.com
+  GH_TSA: https://timestamp.githubapp.com/api/v1/timestamp
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          cosign-release: 'v3.1.4'
+      - uses: fluxcd/flux2/action@main
+        with:
+          version: 2.10.0
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Push four distinct Flux artifacts
+        run: |
+          set -euo pipefail
+          for v in a-publicgood b-gh-bundle c-gh-legacy d-gh-attest; do
+            mkdir -p "src-$v"
+            printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: probe-%s\ndata:\n  run: "%s"\n' "$v" "$GITHUB_RUN_ID" > "src-$v/cm.yaml"
+            flux push artifact "oci://$PKG:$v" --path "src-$v" \
+              --source "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" --revision "main@sha1:$GITHUB_SHA" --output json > "push-$v.json"
+            echo "${v}=$(jq -r .digest "push-$v.json")" >> digests.env
+          done
+          cat digests.env
+      - name: A — public-good keyless, exact production flags
+        run: |
+          set -euo pipefail
+          d=$(grep ^a- digests.env | cut -d= -f2)
+          cosign sign --yes --new-bundle-format=false --use-signing-config=false \
+            --registry-referrers-mode=legacy "$PKG@$d"
+      - name: B — GitHub instance, new bundle format, TSA, no tlog
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          d=$(grep ^b- digests.env | cut -d= -f2)
+          cosign sign --yes --use-signing-config=false --new-bundle-format=true \
+            --registry-referrers-mode=legacy \
+            --fulcio-url "$GH_FULCIO" --timestamp-server-url "$GH_TSA" \
+            --tlog-upload=false --insecure-skip-verify "$PKG@$d"
+      - name: C — GitHub instance, legacy format, TSA, no tlog
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          d=$(grep ^c- digests.env | cut -d= -f2)
+          cosign sign --yes --use-signing-config=false --new-bundle-format=false \
+            --registry-referrers-mode=legacy \
+            --fulcio-url "$GH_FULCIO" --timestamp-server-url "$GH_TSA" \
+            --tlog-upload=false --insecure-skip-verify "$PKG@$d"
+      - name: D digest
+        id: d
+        run: echo "digest=$(grep ^d- digests.env | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+      - name: D — actions/attest forced onto GitHub instance, pushed to registry
+        continue-on-error: true
+        uses: actions/attest@v3
+        with:
+          subject-name: ghcr.io/aljazceru/sigstore-probe-pkg
+          subject-digest: ${{ steps.d.outputs.digest }}
+          predicate-type: https://example.com/probe/v1
+          predicate: '{}'
+          push-to-registry: true
+          private-signing: true
+      - name: Trusted roots
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh attestation trusted-root > roots.jsonl
+          jq -c 'select(any(.certificateAuthorities[]?; .uri|test("githubapp")))' roots.jsonl > github-trusted-root.json
+          jq -c '{cas:[.certificateAuthorities[]?|.uri], tsas:[.timestampAuthorities[]?|.uri]}' github-trusted-root.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: probe-oci
+          path: |
+            digests.env
+            github-trusted-root.json
