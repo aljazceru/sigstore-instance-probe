@@ -1,0 +1,79 @@
+name: probe-outage
+on:
+  workflow_dispatch:
+permissions:
+  id-token: write
+  packages: write
+  contents: read
+env:
+  PKG: ghcr.io/aljazceru/sigstore-probe-pkg
+  ID: https://github.com/${{ github.repository }}/.github/workflows/probe-outage.yml@${{ github.ref }}
+jobs:
+  outage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          cosign-release: 'v3.1.4'
+      - uses: fluxcd/flux2/action@main
+        with:
+          version: 2.10.0
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Fetch GitHub trusted root and write signing config (before the outage)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh attestation trusted-root | jq -c 'select(any(.certificateAuthorities[]?; .uri|test("githubapp")))' > github-trusted-root.json
+          cosign signing-config create \
+            --fulcio="url=https://fulcio.githubapp.com,api-version=1,start-time=2024-01-01T00:00:00Z,operator=github.com" \
+            --oidc-provider="url=https://token.actions.githubusercontent.com,api-version=1,start-time=2024-01-01T00:00:00Z,operator=github.com" \
+            --tsa="url=https://timestamp.githubapp.com/api/v1/timestamp,api-version=1,start-time=2024-01-01T00:00:00Z,operator=github.com" \
+            --tsa-config="EXACT:1" --out github-signing-config.json
+      - name: Simulate a full public Sigstore outage
+        run: |
+          set -euo pipefail
+          rm -rf ~/.sigstore
+          for h in sigstore.dev fulcio.sigstore.dev rekor.sigstore.dev log2025-1.rekor.sigstore.dev \
+                   tuf-repo-cdn.sigstore.dev timestamp.sigstore.dev ctfe.sigstore.dev oauth2.sigstore.dev; do
+            echo "0.0.0.0 $h" | sudo tee -a /etc/hosts >/dev/null
+          done
+          if curl -sS -m 10 https://rekor.sigstore.dev/api/v1/log >/dev/null 2>&1; then echo "outage NOT simulated"; exit 1; fi
+          echo "public Sigstore unreachable"
+      - name: Push artifact
+        run: |
+          set -euo pipefail
+          mkdir src && printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: probe-outage\ndata:\n  run: "%s"\n' "$GITHUB_RUN_ID" > src/cm.yaml
+          flux push artifact "oci://$PKG:outage" --path src --source "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --revision "main@sha1:$GITHUB_SHA" --output json > push.json
+          echo "DIGEST_REF=$PKG@$(jq -r .digest push.json)" >> "$GITHUB_ENV"
+      - name: Control — production signing command during the outage
+        run: |
+          set -uo pipefail
+          timeout 120 cosign sign --yes --new-bundle-format=false --use-signing-config=false \
+            --registry-referrers-mode=legacy "$DIGEST_REF" && { echo "UNEXPECTED: public-good signing succeeded"; exit 1; }
+          echo "public-good signing failed as expected"
+      - name: Fallback — sign with GitHub Sigstore during the outage
+        run: |
+          set -euo pipefail
+          cosign sign --yes --new-bundle-format=true --registry-referrers-mode=legacy \
+            --signing-config github-signing-config.json --trusted-root github-trusted-root.json "$DIGEST_REF"
+      - name: Fallback — verify during the outage
+        run: |
+          set -euo pipefail
+          cosign verify --trusted-root github-trusted-root.json \
+            --certificate-identity "$ID" --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+            --certificate-github-workflow-sha "$GITHUB_SHA" \
+            --use-signed-timestamps --insecure-ignore-tlog --insecure-ignore-sct "$DIGEST_REF" | jq -c '.[0].optional | {Issuer, Subject, githubWorkflowSha}'
+          echo "$DIGEST_REF" > outage-ref.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: probe-outage
+          path: |
+            outage-ref.txt
+            github-trusted-root.json
