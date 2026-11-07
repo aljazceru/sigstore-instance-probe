@@ -1,0 +1,62 @@
+name: probe
+on: [push, workflow_dispatch]
+permissions:
+  id-token: write
+  attestations: write
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "probe $GITHUB_SHA" > artifact.txt
+      - name: actions/attest forced onto GitHub instance
+        id: att
+        uses: actions/attest@v3
+        continue-on-error: true
+        with:
+          subject-path: artifact.txt
+          predicate-type: https://example.com/probe/v1
+          predicate: '{}'
+          private-signing: true
+      - uses: sigstore/cosign-installer@v3
+      - name: cosign sign-blob against GitHub Fulcio + TSA
+        continue-on-error: true
+        run: |
+          cosign version
+          cosign sign-blob --yes artifact.txt \
+            --fulcio-url https://fulcio.githubapp.com \
+            --timestamp-server-url https://timestamp.githubapp.com/api/v1/timestamp \
+            --tlog-upload=false --new-bundle-format --use-signing-config=false \
+            --bundle cosign-github.bundle.json
+      - name: Inspect and verify
+        if: always()
+        run: |
+          gh --version | head -1
+          gh attestation trusted-root > roots.jsonl
+          jq -c '{cas:[.certificateAuthorities[]?|.uri], tlogs:[.tlogs[]?|.baseUrl], tsas:[.timestampAuthorities[]?|.uri]}' roots.jsonl
+          jq -c 'select(any(.certificateAuthorities[]?; .uri|test("githubapp")))' roots.jsonl > github-root.json
+          for b in "${{ steps.att.outputs.bundle-path }}" cosign-github.bundle.json; do
+            [ -s "$b" ] || { echo "no bundle $b"; continue; }
+            echo "== $b"
+            jq -c '{media:.mediaType, tlog:(.verificationMaterial.tlogEntries|length), tsa:(.verificationMaterial.timestampVerificationData.rfc3161Timestamps|length)}' "$b"
+            jq -r '.verificationMaterial.certificate.rawBytes // .verificationMaterial.x509CertificateChain.certificates[0].rawBytes' "$b" | base64 -d | openssl x509 -inform der -noout -issuer -ext subjectAltName || true
+          done
+          ID="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/probe.yml@${GITHUB_REF}"
+          echo "== gh attestation verify (attest bundle)"
+          gh attestation verify artifact.txt --repo "$GITHUB_REPOSITORY" --bundle "${{ steps.att.outputs.bundle-path }}" || true
+          echo "== cosign verify-blob attest bundle with GitHub trusted root"
+          cosign verify-blob-attestation artifact.txt --bundle "${{ steps.att.outputs.bundle-path }}" --new-bundle-format --trusted-root github-root.json \
+            --certificate-identity "$ID" --certificate-oidc-issuer https://token.actions.githubusercontent.com --use-signed-timestamps --insecure-ignore-tlog --type https://example.com/probe/v1 || true
+          echo "== cosign verify-blob cosign bundle with GitHub trusted root"
+          cosign verify-blob artifact.txt --bundle cosign-github.bundle.json --new-bundle-format --trusted-root github-root.json \
+            --certificate-identity "$ID" --certificate-oidc-issuer https://token.actions.githubusercontent.com --use-signed-timestamps --insecure-ignore-tlog || true
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bundles
+          path: |
+            ${{ steps.att.outputs.bundle-path }}
+            cosign-github.bundle.json
+            github-root.json
